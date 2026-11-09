@@ -13,6 +13,35 @@ const { getMimeType } = require('@zapwebp/shared');
 const { resolveOptions } = require('./options');
 
 /**
+ * Executes storage write with exponential backoff retry on transient network/rate-limit failures.
+ * Fails immediately on permanent errors (auth, not found, forbidden, invalid credentials).
+ * @param {object} adapter
+ * @param {string} bucket
+ * @param {string} targetPath
+ * @param {Uint8Array|Buffer} data
+ * @param {object} writeOpts
+ * @param {number} [maxRetries=3]
+ * @returns {Promise<any>}
+ */
+async function writeWithRetry(adapter, bucket, targetPath, data, writeOpts, maxRetries = 3) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await adapter.write(bucket, targetPath, data, writeOpts);
+    } catch (err) {
+      attempt++;
+      const msg = (err && err.message ? err.message : String(err)).toLowerCase();
+      const isPermanent = msg.includes('auth') || msg.includes('credential') || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('not found') || msg.includes('permission');
+      if (attempt >= maxRetries || isPermanent) {
+        throw err;
+      }
+      const delay = Math.round(50 * Math.pow(2, attempt) + Math.random() * 20);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+/**
  * Wraps a StorageAdapter with the Zapwebp conversion and multi-scale pipeline.
  * Intercept -> Convert -> Upload.
  * @param {import('./types').StorageAdapter} adapter
@@ -77,7 +106,7 @@ function withZapwebp(adapter, options) {
         if (dir === '.' || dir === '/') dir = '';
         if (resolved.outPrefix) dir = dir ? `${resolved.outPrefix}/${dir}` : resolved.outPrefix;
         const passThroughPath = dir ? `${dir}/${baseName}${ext}` : `${baseName}${ext}`;
-        await adapter.write(bucket, passThroughPath, bytes, {
+        await writeWithRetry(adapter, bucket, passThroughPath, bytes, {
           contentType: 'application/octet-stream',
           cacheControl: 'public, max-age=31536000, immutable',
           upsert: resolved.onConflict === 'overwrite',
@@ -169,7 +198,8 @@ function withZapwebp(adapter, options) {
         throw err;
       }
 
-      const writeRes = await adapter.write(
+      const writeRes = await writeWithRetry(
+        adapter,
         bucket,
         targetPath,
         result.data,
@@ -196,7 +226,8 @@ function withZapwebp(adapter, options) {
       const origTargetPath = dir ? `${dir}/${origFileName}` : origFileName;
       const origMime = getMimeType(format) || 'application/octet-stream';
 
-      await adapter.write(
+      await writeWithRetry(
+        adapter,
         bucket,
         origTargetPath,
         bytes,
@@ -221,7 +252,8 @@ function withZapwebp(adapter, options) {
     if (resolved.emitManifest) {
       const manifestPath = dir ? `${dir}/${baseName}.manifest.json` : `${baseName}.manifest.json`;
       const manifestBytes = Buffer.from(JSON.stringify(manifestData, null, 2), 'utf8');
-      await adapter.write(
+      await writeWithRetry(
+        adapter,
         bucket,
         manifestPath,
         manifestBytes,
