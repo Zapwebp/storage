@@ -94,6 +94,12 @@ function withZapwebp(adapter, options) {
    * @returns {Promise<import('./types').UploadReport>}
    */
   async function upload(bucket, filePath, bytesOrUrl, uploadOptions = {}) {
+    if ((uploadOptions.deleteOriginal || resolved.deleteOriginal) && !uploadOptions.allowDeleteOriginal && !resolved.allowDeleteOriginal) {
+      const err = new Error("E_DELETE_NOT_ENABLED: Original file deletion requires explicit opt-in. Pass allowDeleteOriginal: true in options or configure allowDeleteOriginal: true in .zapwebp/config.json.");
+      err.code = 'E_DELETE_NOT_ENABLED';
+      throw err;
+    }
+
     // 1. Path Sandboxing & Length Limits
     const sanitizedPath = validateStoragePath(filePath);
 
@@ -101,11 +107,39 @@ function withZapwebp(adapter, options) {
     let bytes = bytesOrUrl;
     if (typeof bytesOrUrl === 'string' && (bytesOrUrl.startsWith('http://') || bytesOrUrl.startsWith('https://'))) {
       validateSafeUrl(bytesOrUrl);
-      const res = await fetch(bytesOrUrl);
+      const res = await fetch(bytesOrUrl, { signal: AbortSignal.timeout(10000) });
       if (!res.ok) {
         throw new Error(`E_STORAGE: Failed to fetch remote source image "${bytesOrUrl}": HTTP ${res.status}`);
       }
-      bytes = new Uint8Array(await res.arrayBuffer());
+      const maxAllowed = resolved.maxBytes || 5 * 1024 * 1024;
+      if (!res.body) {
+        bytes = new Uint8Array(await res.arrayBuffer());
+      } else {
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          received += value.byteLength;
+          if (received > maxAllowed) {
+            await reader.cancel('Max bytes exceeded');
+            throw new ZapwebpError({
+              code: 'E_TOO_LARGE',
+              message: `Remote image at "${bytesOrUrl}" exceeds maximum allowed size of ${maxAllowed} bytes.`,
+              fix: 'Provide an image under the configured maxBytes limit.',
+            });
+          }
+          chunks.push(value);
+        }
+        const total = new Uint8Array(received);
+        let pos = 0;
+        for (const c of chunks) {
+          total.set(c, pos);
+          pos += c.byteLength;
+        }
+        bytes = total;
+      }
     }
 
     if (!bytes || (!Buffer.isBuffer(bytes) && !(bytes instanceof Uint8Array))) {
@@ -149,6 +183,11 @@ function withZapwebp(adapter, options) {
           upsert: resolved.onConflict === 'overwrite',
         });
         return {
+          path: passThroughPath,
+          url: '',
+          bytes: byteLength,
+          originalBytes: byteLength,
+          converted: false,
           source: { path: filePath, bytes: byteLength, format: 'unknown' },
           outputs: [{ scale: 1, path: passThroughPath, bytes: byteLength, format: 'unknown', passedThrough: true }],
           manifest: null,
@@ -191,6 +230,11 @@ function withZapwebp(adapter, options) {
           throw new Error(`E_CONFLICT: Destination file already exists at "${primaryTargetPath}"`);
         }
         return {
+          path: primaryTargetPath,
+          url: '',
+          bytes: 0,
+          originalBytes: byteLength,
+          converted: false,
           source: {
             path: filePath,
             bytes: byteLength,
@@ -223,6 +267,9 @@ function withZapwebp(adapter, options) {
           clean: resolved.clean,
           stripMetadata: resolved.clean,
           background: resolved.background,
+          targetBytes: uploadOptions.targetBytes !== undefined ? uploadOptions.targetBytes : resolved.targetBytes,
+          minQuality: uploadOptions.minQuality !== undefined ? uploadOptions.minQuality : resolved.minQuality,
+          allowDownscale: uploadOptions.allowDownscale !== undefined ? uploadOptions.allowDownscale : resolved.allowDownscale,
           transforms: uploadOptions.transforms || resolved.transforms,
           assertAlpha: false,
           policy: uploadOptions.policy || resolved.policy,
@@ -301,7 +348,13 @@ function withZapwebp(adapter, options) {
       );
     }
 
+    const primaryOut = uploadedOutputs[0] || {};
     return {
+      path: primaryOut.path || filePath,
+      url: primaryOut.publicUrl || '',
+      bytes: primaryOut.bytes || byteLength,
+      originalBytes: byteLength,
+      converted: true,
       source: {
         path: filePath,
         bytes: byteLength,
@@ -396,12 +449,13 @@ function withZapwebp(adapter, options) {
     }
 
     const targets = new Set();
+    const targetExt = resolved.targetFormat === 'jpeg' ? 'jpg' : (resolved.targetFormat || 'webp');
 
     // 1. Configured scales + standard @1x/@2x/@3x scales
     const allScales = new Set([...resolved.scale, 1, 2, 3]);
     for (const s of allScales) {
       const suffix = scaleSuffix(s);
-      targets.add(dir ? `${dir}/${baseName}${suffix}.webp` : `${baseName}${suffix}.webp`);
+      targets.add(dir ? `${dir}/${baseName}${suffix}.${targetExt}` : `${baseName}${suffix}.${targetExt}`);
     }
 
     // 2. Manifest file
@@ -436,16 +490,111 @@ function withZapwebp(adapter, options) {
     }
   }
 
-  return {
+  const instance = {
     adapter,
     options: resolved,
     upload,
     uploadMany,
     remove,
   };
+
+  instance.pool = (opts) => createPool(instance, opts);
+  return instance;
+}
+
+/**
+ * Creates a bounded worker pool for managing batch uploads with concurrency and rate-limiting.
+ *
+ * @param {import('./types').ZapwebpStorageInstance} zap
+ * @param {{
+ *   concurrency?: number,
+ *   rateLimit?: { maxPerInterval: number, intervalMs: number }
+ * }} [poolOptions]
+ * @returns {{ uploadMany: (bucket: string, files: Array<{ path: string, bytes?: Uint8Array|Buffer|string } | string>) => Promise<any>, zap: import('./types').ZapwebpStorageInstance }}
+ */
+function createPool(zap, poolOptions = {}) {
+  if (!zap || typeof zap.upload !== 'function') {
+    throw new TypeError('createPool requires a ZapwebpStorageInstance with an upload method.');
+  }
+
+  const concurrency = Math.max(1, Math.min(16, Number(poolOptions.concurrency) || 4));
+  const rateLimit = poolOptions.rateLimit;
+
+  async function uploadMany(bucket, files) {
+    if (!Array.isArray(files)) {
+      throw new TypeError('files must be an array of file paths or { path, bytes } objects.');
+    }
+
+    let tokens = rateLimit?.maxPerInterval || Infinity;
+    let lastReset = Date.now();
+    const intervalMs = rateLimit?.intervalMs || 60000;
+    const maxTokens = rateLimit?.maxPerInterval || Infinity;
+
+    async function acquireToken() {
+      if (!rateLimit) return;
+      while (true) {
+        const now = Date.now();
+        if (now - lastReset >= intervalMs) {
+          tokens = maxTokens;
+          lastReset = now;
+        }
+        if (tokens > 0) {
+          tokens--;
+          return;
+        }
+        const waitTime = Math.max(50, intervalMs - (now - lastReset) + 10);
+        await new Promise((r) => setTimeout(r, waitTime));
+      }
+    }
+
+    const fs = require('node:fs');
+    const reports = new Array(files.length);
+    let cursor = 0;
+
+    async function worker() {
+      while (cursor < files.length) {
+        const idx = cursor++;
+        const item = files[idx];
+        const filePath = typeof item === 'string' ? item : item.path;
+        let fileBytes = typeof item === 'object' && item.bytes ? item.bytes : null;
+
+        if (!fileBytes && typeof item === 'string') {
+          fileBytes = await fs.promises.readFile(filePath);
+        }
+
+        await acquireToken();
+        const rep = await zap.upload(bucket, filePath, fileBytes);
+        reports[idx] = rep;
+      }
+    }
+
+    const activeWorkers = Array.from({ length: Math.min(concurrency, files.length) }, () => worker());
+    await Promise.all(activeWorkers);
+
+    const totalIn = reports.reduce((acc, r) => acc + (r.source?.bytes || r.originalBytes || 0), 0);
+    const totalOut = reports.reduce((acc, r) => acc + (r.outputs?.[0]?.bytes || r.bytes || 0), 0);
+    const savedBytes = Math.max(0, totalIn - totalOut);
+    const savedPercent = totalIn > 0 ? Math.round((savedBytes / totalIn) * 100) : 0;
+
+    reports.summary = {
+      files: reports.length,
+      bytesIn: totalIn,
+      bytesOut: totalOut,
+      savedBytes,
+      saved: savedPercent,
+    };
+
+    return reports;
+  }
+
+  return {
+    uploadMany,
+    zap,
+  };
 }
 
 module.exports = {
   withZapwebp,
   writeWithRetry,
+  createPool,
 };
